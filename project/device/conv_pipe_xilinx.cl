@@ -43,14 +43,6 @@
 #include "hw_param.cl"
 #include "pipe.cl" // for xilinx, the channels are defined here by using pipes
 
-pipe bool pool_sync_ch __attribute__((xcl_reqd_pipe_depth(32)));
-#define pool_sync_ch_write_pipe_block(input_data) { bool temp; \
-                                                    temp = input_data; \
-                                                    write_pipe_block(pool_sync_ch, &temp); }
-#define pool_sync_ch_read_pipe_block(input_data)  { bool temp; \
-                                                    read_pipe_block (pool_sync_ch, &temp);\
-                                                    input_data = temp;}
-
 // Define the precision of the data-path
 typedef char DPTYPE;
 typedef int  MACTYPE;
@@ -69,6 +61,11 @@ typedef struct {
 typedef struct {
     DPTYPE lane[LANE_NUM];
 } channel_scal;
+#ifdef RESNET
+typedef struct {
+   float lane[LANE_NUM];
+} channel_scal_float;
+#endif
 
 
 // parallel MAC units including (VEC_SIZE-1) multipliers
@@ -436,8 +433,8 @@ void coreConv(
     DPTYPE  conv_final[LANE_NUM];
 
     // each iteration generates one output
-loop1:
-    for(unsigned int k=0; k<output_num; k++){
+
+    loop1:for(unsigned int k=0; k<output_num; k++){
 
         bias_ch_read_pipe_block(bias_ch_out);
 
@@ -454,8 +451,7 @@ loop1:
 			}
 		}
 
-loop2:
-        for(int j=0; j<conv_loop_cnt; j++){
+        loop2:for(int j=0; j<conv_loop_cnt; j++){
 
             // load data and weights for each lane
             data_read_pipe_block(mac_data);
@@ -470,7 +466,7 @@ loop2:
 
                 // Shift the pipelined registers backwards
                 __attribute__((opencl_unroll_hint))
-                for(unsigned int p=PIPE_DEPTH-1; p>0; p-- ) {
+                for(unsigned int p=PIPE_DEPTH-1; p>0; p-- ){
                     accum_piped[ll][p] = MASK_ACCUM & accum_piped[ll][p-1];
                 }
 
@@ -522,10 +518,12 @@ loop2:
 			conv_ch_in.lane[ll]= conv_final[ll];
 		}
 		//BatchNorm
-		if(contol==0)
-			conv_ch_write_pipe_block(conv_ch_in);
-		else//for fc layer no bn,Write
-			bypass_ch_write_pipe_block(conv_ch_in);
+		if(contol==0){
+            conv_ch_write_pipe_block(conv_ch_in);
+        }
+		else{
+            bypass_bn_ch_write_pipe_block(conv_ch_in);
+        }
 #else
 
             // Relu operation
@@ -550,6 +548,100 @@ loop2:
     }// end of output loop
     //printf("Kernel coreConv lanched !!!\n");
 }
+
+#ifdef RESNET
+__kernel
+//__attribute__((task))
+__attribute__((max_global_work_dim(0)))
+void batchNorm(
+				uint dim1xdim2,
+				uint input_num,//dim1*dim2*dim3/LANE_NUM
+				uint  contol, //[0]-> relu  [1]->bypass pooling
+				//char  frac_dout,
+				float frac2float,//conv out conver to float
+				float frac2char,//bn out conver to char
+				__global channel_scal_float *restrict mean,
+				__global channel_scal_float *restrict var,
+				__global channel_scal_float *restrict alpha,
+				__global channel_scal_float *restrict beta)
+{
+	channel_scal conv_ch_out;
+	channel_scal batchNorm_final;
+	channel_scal bn_ch_in;
+	float bn_in;
+	float bn_out;
+	float sc_out;
+	channel_scal_float mean_ch;
+	channel_scal_float var_ch;
+	channel_scal_float alpha_ch;
+	channel_scal_float beta_ch;
+
+	unsigned int iter=0;
+	unsigned int j=dim1xdim2;
+
+	DPTYPE out_final;
+	float out_conver;
+	for(unsigned int k=0; k<input_num; k++,j++){
+        conv_ch_read_pipe_block(conv_ch_out);
+		if(j==dim1xdim2)
+		{
+			mean_ch = mean[iter];
+			var_ch = var[iter];
+			alpha_ch = alpha[iter];
+			beta_ch = beta[iter];
+			iter=iter+1;
+			j=0;
+		}
+		
+		// #pragma unroll
+		for(unsigned char ll=0; ll<LANE_NUM;ll++){
+			// ll=part*LANE_NUM_DIV_PART_NUM+part_ll;
+			// Convert DPTYPE fixed-point to float
+			// Input data has "frac_dout" fractional bits
+			// bn_in = convert_float(conv_ch_out.lane[ll])*pow(2,-frac_dout);
+			// bn_in = convert_float(conv_ch_out.lane[ll])*frac2float;
+            bn_in = ((float)conv_ch_out.lane[ll])*frac2float;
+			// top(:,:,n)=(bottom(:,:,n)-mean(n))/(variance(n).^0.5);
+			bn_out=(bn_in-mean_ch.lane[ll])*var_ch.lane[ll];
+			//top(:,:,n)=bottom(:,:,n)*alpha(n)+beta(n);
+			sc_out=bn_out*alpha_ch.lane[ll]+beta_ch.lane[ll];
+
+			// Convert float to DPTYPE fixed-point
+			// out_conver=sc_out*pow(2,frac_dout);
+			out_conver=sc_out*frac2char;
+			if(out_conver>=0)
+				out_conver=out_conver+0.5;
+			else
+				out_conver=out_conver-0.5;
+
+			if(out_conver>127)
+				out_conver=127;
+			else if(out_conver<-128)
+				out_conver=-128;
+			// batchNorm_final.lane[ll]=convert_char_rtz(out_conver);//Round towards zero
+            batchNorm_final.lane[ll]=(char)out_conver;//Round towards zero
+			// Relu operation
+			if((contol&0x01)==0x01){
+				if((batchNorm_final.lane[ll]&MASKSIGN)==MASKSIGN) // MSB is sign bit
+					bn_ch_in.lane[ll] = 0;
+				else
+					bn_ch_in.lane[ll] = batchNorm_final.lane[ll];
+			}
+			else
+				bn_ch_in.lane[ll] = batchNorm_final.lane[ll];
+#ifdef DEBUG_BN
+			printf("ll=%d,conv_ch_out=%d,bn_in=%f,sc_out=%f,batchNorm_final.lane[ll]=%d,bn_ch_in.lane[ll]=%d\n",ll,conv_ch_out.lane[ll],bn_in,sc_out,batchNorm_final.lane[ll],bn_ch_in.lane[ll]);
+#endif
+		}
+
+	batchNorm_ch_write_pipe_block(bn_ch_in);
+	//printf("Write channel item-%d is written in channel %d...\n", k, ll);
+	}
+	//printf("Kernel batchNorm lanched !!!\n");
+}
+#endif
+
+
 
 
 __kernel
@@ -613,11 +705,8 @@ void maxPool(
 	pool_y_cnt = 0;
 	pool_group_cnt = 0;
 	//#pragma ivdep array(pool_final)
-
-    // pool_sync_ch_read_pipe_block(pool_sync);
 	for(ushort i = 0; i < pool_times; i++){
 		pool_sync_ch_read_pipe_block(pool_sync);
-        // barrier((CLK_GLOBAL_MEM_FENCE);
 
 		// init counters
 		pool_win_cnt = 0;
@@ -759,7 +848,8 @@ void maxPool(
 
 // Store Data to Global Memory
 __kernel
-__attribute__((reqd_work_group_size(1,1,LANE_NUM)))
+__attribute__((reqd_work_group_size(1,1,1)))
+//__attribute__((xcl_dataflow))
 void memWrite(
 				// Params Ports
 				uchar  out_dim1,
@@ -779,101 +869,362 @@ void memWrite(
 				uchar  pool_stride,
 				// Data Ports
 				__global DPTYPE *restrict top
-				)
+)
+{
+    uchar index_z_item; // max value 256
+    ushort index_z_group; // max value 4096
+	uint top_addr;
+	bool pool_on_signal=1;
+
+    channel_scal output __attribute__((xcl_data_pack(output)));
+    __local DPTYPE buffer[LANE_NUM] __attribute__((xcl_array_partition(complete,1)));
+    for(unsigned int loop_z=0; loop_z<out_dim3/LANE_NUM; loop_z++) {
+        for(unsigned int loop_y=0; loop_y<out_dim2; loop_y++) {
+            for(unsigned int loop_x=0; loop_x<out_dim1; loop_x++) {
+                for(unsigned int loop=0; loop<LANE_NUM; loop++) {
+
+                    if(loop==0) {
+						#ifdef RESNET
+							if(bypass==0){//bypass==0,bn
+								// for ResNet padding
+								if((pool_on == 1) && ((loop_y >= out_dim2-pool_pad) || ((loop_x >= out_dim1-pool_pad)))){
+										__attribute__((opencl_unroll_hint))
+										for(uchar ll=0; ll<LANE_NUM; ll++){
+											output.lane[ll]=CZERO;
+										}
+								}
+								else{
+									batchNorm_ch_read_pipe_block(output);
+								}
+							}
+							else // bypass == 1 bypass_bn_ch
+								bypass_bn_ch_read_pipe_block(output);
+
+						#else
+							conv_ch_read_pipe_block(output);
+						#endif
+						
+						// store the vectorized output into local buffer
+						__attribute__((opencl_unroll_hint))
+						for(uchar ll=0; ll<LANE_NUM; ll++){
+							buffer[ll]=output.lane[ll];
+						}
+                    }
+
+					barrier(CLK_LOCAL_MEM_FENCE);
+
+					// fetch data from local buffer and write back to DDR
+					// perform vectorization in dim3 (global_z) by combining multiple DPTYPE data into lane_data type
+
+					if(pool_on == 1){
+							top_addr = loop_z*out_dim1x2xbatch*LANE_NUM +(loop_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*LANE_NUM + (loop_x+batch_indx_dim1*out_dim1)*LANE_NUM + loop;
+						}
+					else{
+							index_z_group = (loop_z*LANE_NUM+loop-padd_offset)/VEC_SIZE;
+							index_z_item  = (loop_z*LANE_NUM+loop-padd_offset)%VEC_SIZE;
+							top_addr = index_z_group*out_dim1x2xbatch*VEC_SIZE + (loop_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*VEC_SIZE + (loop_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item;
+						}
+
+					// output dim3 in current layer may be larger than next layer (the value is changed to a value of multiples of LANE_NUM to saturated the wide pipeline input)
+					// therefore, only write back the valid values without padding zeros
+					if((loop_z*LANE_NUM+loop-padd_offset)<out_dim3 && (loop_z*LANE_NUM+loop>=padd_offset)){
+						// 1. addressing expression with out batch processing is
+						// top[index_z_group*dim1*dim2*VEC_SIZE + global_y*dim1*VEC_SIZE + global_x*VEC_SIZE + index_z_item]=buffer[local_z];
+						// 2. addressing expression with batch processing (batch_size_in_dim = sqrt(batch_size)) is
+						// top[(index_z_group*out_dim2*out_dim1*batch_size_in_dim*batch_size_in_dim*VEC_SIZE + (global_y+batch_indx_dim2*out_dim2)*batch_size_in_dim*out_dim1*VEC_SIZE + (global_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item] = buffer[local_z];
+						// 3. simplified addressing with reduced cost of multipliers
+						//printf("b=%d\n",index_z_group*out_dim1x2xbatch*VEC_SIZE + (global_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*VEC_SIZE + (global_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item);
+
+						top[top_addr] = buffer[loop];
+						// #define  DEBUG_MEMWR
+						#ifdef DEBUG_MEMWR
+						//if((global_z-padd_offset) == 0){
+							//for(unsigned char ll=0; ll<LANE_NUM; ll++){
+							printf("MemWr results= %f (x=%d, y=%d, z=%d, ll=%d)\n", (float)output.lane[0], loop_x, loop_y, loop_z*LANE_NUM+loop, 0);
+							//}
+						//	}
+						#endif
+
+					}
+
+					barrier(CLK_LOCAL_MEM_FENCE);
+
+					if(pool_on == 1){
+						if((loop_x==out_dim1-1)&&(loop_y > 0)&&((loop_y-pool_size+1)%2 == 0)&&(loop ==LANE_NUM-1)){
+							pool_sync_ch_write_pipe_block(pool_on_signal);
+						}
+					}
+
+                }
+            }
+        }
+    }
+}
+
+#ifdef RESNET
+__kernel
+//__attribute__((task))
+__attribute__((max_global_work_dim(0)))
+void eltwise(
+			uint  input_num,//dim1*dim2*dim3/VEC_SIZE
+			uchar pool_on,//only avgpool used
+			//uchar pool_size,  // by now, only pooling size is 7
+			uchar  conv_x,
+			uint  conv_xy,
+			uchar  stride,
+			float divisor,	  //1/pool_size^2
+			float in1_frac,
+			float in2_frac,//conver the input frac to output frac
+			// float out_conver2char,
+			__global lane_data *restrict bottom_1,
+			__global lane_data *restrict bottom_2,
+			__global lane_data *restrict top
+			)
+{
+	lane_data data_out;
+	float sum;
+	// float sum[VEC_SIZE];
+	float sumAvg[VEC_SIZE];
+	float out;
+	//uchar pool_size_num;  //pool_size^2
+	//pool_size_num=pool_size*pool_size;
+	uchar conv_itm_x=0;
+	uint  conv_itm_xyz=0;
+	uint xyz_offset=0;
+	uint xy_offset=0;
+	uint ptr=0;
+	uint outnum=0;//if have avgpool the out ptr
+	float avgPoolSum[VEC_SIZE];
+	float avgPoolBuf[VEC_SIZE][ELT_PIPE_DEPTH];
+	__attribute__((opencl_unroll_hint))
+	for(unsigned char vv=0; vv<VEC_SIZE; vv++){
+		avgPoolSum[vv]=0;
+		__attribute__((opencl_unroll_hint))
+		for(unsigned char pp=0; pp<ELT_PIPE_DEPTH; pp++){
+			avgPoolBuf[vv][pp]=0;
+		}
+	}
+
+	for(unsigned int j=0;j<input_num;j++)
+	{
+		__attribute__((opencl_unroll_hint))
+		for(unsigned char vv=0; vv<VEC_SIZE; vv++){
+			sum=bottom_1[j].data[vv]*in1_frac+bottom_2[j].data[vv]*in2_frac;
+			// relu
+			if(sum<0)
+				sum=0;
+			if(pool_on!=3){
+				sum=sum+0.5;
+				// //overflow
+				if(sum>127)
+					sum=127;
+				// data_out.data[vv]=convert_char_rtz(sum);//Round towards zero
+                data_out.data[vv]=(char)(sum);
+			}
+			else{
+				sumAvg[vv]=sum+avgPoolBuf[vv][ELT_PIPE_DEPTH-1];
+				__attribute__((opencl_unroll_hint))
+				for(uchar p=ELT_PIPE_DEPTH-1; p>0; p-- ){
+					avgPoolBuf[vv][p] = avgPoolBuf[vv][p-1];
+				}
+				avgPoolBuf[vv][0]=sumAvg[vv];
+			}
+
+		}
+		if(pool_on==0){
+			top[j]=data_out;
+		}
+		else if(pool_on==2){//stride pool
+			conv_itm_xyz=xyz_offset+xy_offset+conv_itm_x;
+			if(conv_itm_xyz==j){
+				top[outnum]=data_out;
+				outnum++;
+				conv_itm_x=conv_itm_x+stride;
+				if(conv_itm_x>=conv_x){
+					conv_itm_x=0;
+					xy_offset+=stride*conv_x;
+					if(xy_offset>=conv_xy){
+						xy_offset=0;
+						xyz_offset+=conv_xy;
+					}
+				}
+			}
+
+		}
+		else if(pool_on==3){//avgpool
+			ptr=ptr+1;
+			if(ptr==AVGPOOL_SIZE)
+			{
+				ptr=0;
+				__attribute__((opencl_unroll_hint))
+				for(unsigned char vv=0; vv<VEC_SIZE; vv++){
+					__attribute__((opencl_unroll_hint))
+					for(unsigned i=0; i<ELT_PIPE_DEPTH; i++){
+						avgPoolSum[vv] += avgPoolBuf[vv][i];
+						avgPoolBuf[vv][i]=0;
+					}
+					out=avgPoolSum[vv]*divisor+0.5;
+					//overflow,because of relu no <0 value here
+					if(out>127)
+						out=127;
+					//data_out.data[vv]=convert_char_rtz(out);//	Round towards zero
+                    data_out.data[vv]=(char)out;//	Round towards zero
+					avgPoolSum[vv]=0;
+				}
+				top[outnum]=data_out;
+				outnum++;
+			}
+		}
+
+	}
+	//printf("Kernel eltwise lanched !!!\n");
+}
+
+#endif
+
+__kernel
+__attribute__((max_work_group_size(1,1,LRN_MAX_LOCAL_SIZE))) // (x,y,z)
+void lrn(
+			// Params Ports
+			uchar data_dim1,
+			uchar data_dim2,
+			char  frac_dout,
+			// Data Ports
+			__global lane_data *restrict bottom,
+			__global lane_data *restrict top
+		)
 {
 	uchar  global_x = get_global_id(0); // max value 256
 	uchar  global_y = get_global_id(1); // max value 256
 	ushort global_z = get_global_id(2); // max value 4096
-	uchar  local_x 	= get_local_id(0); // max value 256
-	uchar  local_y 	= get_local_id(1); // max value 256
-	uchar  local_z 	= get_local_id(2); // max value 256
-	ushort group_z  = get_group_id(2);
 
-	uchar  index_z_item; // max value 256
-	ushort index_z_group;// max value 4096
-	uint   top_addr;
-	bool pool_on_signal=1;
-    channel_scal output __attribute__((xcl_data_pack(output)));
-	__local DPTYPE buffer[LANE_NUM];
+	#ifdef DEBUG_LRN
+	int local_x = get_local_id(0);
+	int local_y = get_local_id(1);
+	int local_z = get_local_id(2);
+	int block_x = get_group_id(0);
+	int block_y = get_group_id(1);
+	int block_z = get_group_id(2);
+	#endif
 
-	// use the first local work-item to read the vectorized output data from channel
-	if(local_z==0){
-#ifdef RESNET
-    if(bypass==0){//bypass==0,bn
-      // for ResNet padding
-      if((pool_on == 1) && ((global_y >= out_dim2-pool_pad) || ((global_x >= out_dim1-pool_pad)))){
-            __attribute__((opencl_unroll_hint))
-    		for(uchar ll=0; ll<LANE_NUM; ll++){
-    			output.lane[ll]=CZERO;
-    		}
-      }
-      else{
-        pool_ch_read_pipe_block(output);
-      }
-    }
-    else // bypass == 1 bypass_bn_ch
-      bypass_ch_read_pipe_block(output);
+	__local DPTYPE z_buffer[VEC_SIZE*LRN_MAX_LOCAL_SIZE+LRN_WIN_SIZE]; // allocate two more points for padding
+	__local DPTYPE lrn_buffer[VEC_SIZE*LRN_MAX_LOCAL_SIZE];
+	channel_scal data_in;
+	channel_scal data_pad_left;
+	channel_scal data_pad_right;
+	channel_scal data_out;
+	lane_data    data_in_partial;
+	lane_data    data_left_partial;
+	lane_data    data_right_partial;
+	lane_data    data_out_partial;
+	int          *convert_ptr;
+	int          expo;
+	uint         manti;
+	uint         addr_1, addr_2, addr;
+	float        lrn_reg1, lrn_reg2, lrn_tmp, lrn_out;
+	short        lrn_cnvt, lrn_cnvt2;
 
-#else
-        conv_ch_read_pipe_block(output);
-#endif
+	const float coef0[46] = {9.98312401e-01,8.92383765e-01,8.69534866e-01,8.48001507e-01,8.27672857e-01,8.08269896e-01,7.72814246e-01,7.40785193e-01,7.11686616e-01,6.84743320e-01,6.38046300e-01,5.98139529e-01,5.63585746e-01,5.32842946e-01,4.82570938e-01,4.42066574e-01,4.08721176e-01,3.80120836e-01,3.35733988e-01,3.01782553e-01,2.74896454e-01,2.52503409e-01,2.19044754e-01,1.94367577e-01,1.75328514e-01,1.59766323e-01,1.37073713e-01,1.20695464e-01,1.08253750e-01,9.81965345e-02,8.37272488e-02,7.34111523e-02,6.56398695e-02,5.93964327e-02,5.04776032e-02,4.41593533e-02,3.94211944e-02,3.56262849e-02,3.02252062e-02,2.64117530e-02,2.35583854e-02,2.12767794e-02,1.80355644e-02,1.57509127e-02,1.40434261e-02};
+	const float coef1[46] = {-1.07542919e-01,-2.28535953e-02,-2.15331066e-02,-2.03286855e-02,-1.92268508e-02,-3.55023570e-02,-3.20657642e-02,-2.91245494e-02,-2.65861837e-02,-4.68257134e-02,-3.99817597e-02,-3.45887189e-02,-3.02571264e-02,-5.05149626e-02,-4.06040782e-02,-3.34413514e-02,-2.80826706e-02,-4.46757687e-02,-3.40991637e-02,-2.69894342e-02,-2.19616650e-02,-3.37238519e-02,-2.48195600e-02,-1.91265576e-02,-1.52482883e-02,-2.29016249e-02,-1.64847560e-02,-1.25042597e-02,-9.85141038e-03,-1.46114169e-02,-1.03881575e-02,-7.81187564e-03,-6.11526810e-03,-9.00946183e-03,-6.36361270e-03,-4.76376961e-03,-3.71675305e-03,-5.45684726e-03,-3.84135330e-03,-2.86894660e-03,-2.23458481e-03,-3.27498492e-03,-2.30149338e-03,-1.71686994e-03,-1.33609904e-03};
+	const float h_inv[46] = {1.22085215e-04,4.88281250e-04,4.88281250e-04,4.88281250e-04,4.88281250e-04,2.44140625e-04,2.44140625e-04,2.44140625e-04,2.44140625e-04,1.22070313e-04,1.22070313e-04,1.22070313e-04,1.22070313e-04,6.10351563e-05,6.10351563e-05,6.10351563e-05,6.10351563e-05,3.05175781e-05,3.05175781e-05,3.05175781e-05,3.05175781e-05,1.52587891e-05,1.52587891e-05,1.52587891e-05,1.52587891e-05,7.62939453e-06,7.62939453e-06,7.62939453e-06,7.62939453e-06,3.81469727e-06,3.81469727e-06,3.81469727e-06,3.81469727e-06,1.90734863e-06,1.90734863e-06,1.90734863e-06,1.90734863e-06,9.53674316e-07,9.53674316e-07,9.53674316e-07,9.53674316e-07,4.76837158e-07,4.76837158e-07,4.76837158e-07,4.76837158e-07};
+	const float x_sample[46] = {1.00000000e+00,8.19200000e+03,1.02400000e+04,1.22880000e+04,1.43360000e+04,1.63840000e+04,2.04800000e+04,2.45760000e+04,2.86720000e+04,3.27680000e+04,4.09600000e+04,4.91520000e+04,5.73440000e+04,6.55360000e+04,8.19200000e+04,9.83040000e+04,1.14688000e+05,1.31072000e+05,1.63840000e+05,1.96608000e+05,2.29376000e+05,2.62144000e+05,3.27680000e+05,3.93216000e+05,4.58752000e+05,5.24288000e+05,6.55360000e+05,7.86432000e+05,9.17504000e+05,1.04857600e+06,1.31072000e+06,1.57286400e+06,1.83500800e+06,2.09715200e+06,2.62144000e+06,3.14572800e+06,3.67001600e+06,4.19430400e+06,5.24288000e+06,6.29145600e+06,7.34003200e+06,8.38860800e+06,1.04857600e+07,1.25829120e+07,1.46800640e+07,1.67772160e+07};
 
-		// store the vectorized output into local buffer
+	// Load the all data in one line along dim3 into local line buffer
+	__attribute__((opencl_unroll_hint))
+	for(unsigned char ll=0; ll<VEC_SIZE; ll++){
+		z_buffer[global_z*VEC_SIZE+ll+LRN_WIN_SIZE/2] = bottom[global_z*data_dim2*data_dim1 + global_y*data_dim1+ global_x].data[ll];
+	}
+
+	//Padding left
+	if(global_z==0){
 		__attribute__((opencl_unroll_hint))
-		for(uchar ll=0; ll<LANE_NUM; ll++){
-			buffer[ll]=output.lane[ll];
+		for(unsigned char ll=0; ll<LRN_WIN_SIZE/2; ll++){
+			z_buffer[ll] = CZERO;
 		}
 	}
 
-	barrier(CLK_LOCAL_MEM_FENCE);
-
-	// fetch data from local buffer and write back to DDR
-	// perform vectorization in dim3 (global_z) by combining multiple DPTYPE data into lane_data type
-
-	if(pool_on == 1){
-		top_addr = group_z*out_dim1x2xbatch*LANE_NUM +(global_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*LANE_NUM + (global_x+batch_indx_dim1*out_dim1)*LANE_NUM + local_z;
-	}
-	else{
-		index_z_group = (global_z-padd_offset)/VEC_SIZE;
-		index_z_item  = (global_z-padd_offset)%VEC_SIZE;
-		top_addr = index_z_group*out_dim1x2xbatch*VEC_SIZE + (global_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*VEC_SIZE + (global_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item;
+	// Padding right
+	if(global_z==(get_global_size(2)-1)){
+		__attribute__((opencl_unroll_hint))
+		for(unsigned char ll=0; ll<LRN_WIN_SIZE/2; ll++){
+			z_buffer[VEC_SIZE*get_local_size(2)+ll+LRN_WIN_SIZE/2] = CZERO;
+		}
 	}
 
-	// output dim3 in current layer may be larger than next layer (the value is changed to a value of multiples of LANE_NUM to saturated the wide pipeline input)
-	// therefore, only write back the valid values without padding zeros
-	if((global_z-padd_offset)<out_dim3 && (global_z>=padd_offset)){
-		// 1. addressing expression with out batch processing is
-		// top[index_z_group*dim1*dim2*VEC_SIZE + global_y*dim1*VEC_SIZE + global_x*VEC_SIZE + index_z_item]=buffer[local_z];
-		// 2. addressing expression with batch processing (batch_size_in_dim = sqrt(batch_size)) is
-		// top[(index_z_group*out_dim2*out_dim1*batch_size_in_dim*batch_size_in_dim*VEC_SIZE + (global_y+batch_indx_dim2*out_dim2)*batch_size_in_dim*out_dim1*VEC_SIZE + (global_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item] = buffer[local_z];
-		// 3. simplified addressing with reduced cost of multipliers
-		//printf("b=%d\n",index_z_group*out_dim1x2xbatch*VEC_SIZE + (global_y+batch_indx_dim2*out_dim2)*out_dim1xbatch*VEC_SIZE + (global_x+batch_indx_dim1*out_dim1)*VEC_SIZE + index_z_item);
+	#ifdef DEBUG_LRN
+	if(global_z==0&&global_x==0&&global_y==0)
+	printf("Kernel LRN: work-item x=%d, y=%d, z=%d(z_local=%d)\n", global_x, global_y, global_z, local_z);
+	#endif
+	barrier(CLK_LOCAL_MEM_FENCE); // fill all values of the line bufer before reading it
 
-		top[top_addr] = buffer[local_z];
-        // #define  DEBUG_MEMWR
-		#ifdef DEBUG_MEMWR
-		//if((global_z-padd_offset) == 0){
-			//for(unsigned char ll=0; ll<LANE_NUM; ll++){
-			printf("MemWr results= %f (x=%d, y=%d, z=%d, ll=%d)\n", (float)output.lane[0], global_x, global_y, global_z, 0);
-			//}
-		//	}
+	// Piecewise interpolation pipeline for lrn operation (i.e., y=pwlf(x'))
+	for(unsigned char ll=0; ll<VEC_SIZE; ll++){
+		// First Step: Coefficients table looking-up
+		// Calculate x'=sum(x(k)^2) for the pwlf function, x(k)s are from adjacent featuremaps
+		lrn_reg2 = CZERO;
+		__attribute__((opencl_unroll_hint))
+		for(char k=-LRN_WIN_SIZE/2; k<=LRN_WIN_SIZE/2; k++){
+			// Convert DPTYPE fixed-point to float
+			// Input data has "frac_dout" fractional bits
+			// Note: current version only support frac_dout<0
+			lrn_cnvt = z_buffer[global_z*VEC_SIZE+ll+k+LRN_WIN_SIZE/2]<<(-frac_dout);
+			// lrn_reg1 = convert_float(lrn_cnvt);
+			lrn_reg1 = (float)lrn_cnvt;
+			lrn_reg2 += lrn_reg1 * lrn_reg1;
+			#ifdef DEBUG_LRN
+			if(global_z==0&&global_x==0&&global_y==0)
+			printf("x=%f(k=%d), ", lrn_reg1, k);
+			#endif
+		}
+		// Get the exponent and mantissa of x' (assuming x'>=0)
+		convert_ptr = (int*) (&lrn_reg2);
+		// substract the bias 127 to get exponent
+		expo = (EXP_MASK & (*convert_ptr >> MAN_BITS)) - 127;
+		manti = ((*convert_ptr) & MAN_MASK); //does not include the implicit 1
+
+		// Get level-1 table item (segment) index from exponent
+		addr_1 = ((expo-EXP_STEP_MIN)>>EXP_STEP_LOG)<<MAN_INDEX_BITS;
+		// Get level-2 table item (segment) index from mantissa
+		addr_2 = (manti>>(MAN_BITS-MAN_INDEX_BITS) & MAN_INDEX_MASK)+1;
+		// Combine level-1 and level-2 table index to get true table address
+		if(expo<EXP_STEP_MIN)
+			addr = 0; // use the first segment
+		else
+			addr = addr_1+addr_2;
+
+		// Sencond Step: Perform piecewise linear interpolation
+		lrn_tmp = ((lrn_reg2-x_sample[addr])*h_inv[addr])*coef1[addr] + coef0[addr];
+
+		// Third Step: Perform lrn operation
+		lrn_cnvt2 = z_buffer[global_z*VEC_SIZE+ll+LRN_WIN_SIZE/2]<<(-frac_dout);
+		// lrn_out = lrn_tmp*convert_float(lrn_cnvt2);
+		lrn_out = lrn_tmp*(float)lrn_cnvt2;
+
+		// Convert float to DPTYPE fixed-point
+		// Note: current version only support frac_din=0 for next layer
+		// lrn_buffer[global_z*VEC_SIZE+ll] = convert_char_rte(lrn_out);
+		lrn_out = lrn_out+0.5;
+		if(lrn_out>127)
+			lrn_out = 127;
+		lrn_buffer[global_z*VEC_SIZE+ll] = (char)(lrn_out);
+
+		#ifdef DEBUG_LRN
+		if(global_z==0&&global_x==0&&global_y==0)
+		printf("\nKernel LRN (ll=%d): pwlf_x=%f, expo=%d, addr=%d, pwlf_y=%f, lrn=%f\n", ll, lrn_reg2, expo, addr, lrn_tmp, lrn_out);
 		#endif
-
+		barrier(CLK_LOCAL_MEM_FENCE);
 	}
 
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-	if(pool_on == 1){
-        // ushort global_size_x = get_global_size(0);
-        // ushort global_size_y = get_global_size(1);
-        // ushort global_size_z = get_global_size(2);
-
-        // if((global_x==global_size_x-1)&&(global_y==global_size_y-1)&&(global_z==global_size_z-1)){
-        //     pool_sync_ch_write_pipe_block(pool_on_signal);
-        // }
-		if((global_x==out_dim1-1)&&(global_y > 0)&&((global_y-pool_size+1)%2 == 0)&&(local_z ==LANE_NUM-1)){
-            pool_sync_ch_write_pipe_block(pool_on_signal);
-		}
+	// Store the results back to global mem
+	__attribute__((opencl_unroll_hint))
+	for(unsigned char vv=0; vv<VEC_SIZE; vv++){
+		data_out_partial.data[vv]=lrn_buffer[global_z*VEC_SIZE+vv];
 	}
+	top[global_z*data_dim2*data_dim1 + global_y*data_dim1 + global_x] = data_out_partial;
+
+	#ifdef DEBUG_LRN_OUT
+	if(global_z==0&&global_x==0&&global_y==0)
+	printf("\nKernel LRN OUT: x=%d, y=%d, z=%d, result=%f\n", global_x, global_y, global_z, (float)data_out_partial.data[0]);
+	#endif
 
 }

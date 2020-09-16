@@ -390,14 +390,14 @@ unsigned layer_config[][NUM_CONFIG_ITEM] = {{0,
 							2}//Layer-8 fc
 							};
 
-char precision_config[][3] ={{8,  0, -4},//Layer-1
-							{ 8,  0, -2},//Layer-2
-							{ 8,  0, -1},//Layer-3
-							{ 8, -1, -1},//Layer-4
-							{ 8, -1, -1},//Layer-5
-							{11, -1,  0},//Layer-6
-							{10,  0,  2},//Layer-7
-							{10,  2,  2}//Layer-8
+char precision_config[][3] ={{(char) 8, (char) 0, (char)-4},//Layer-1
+							{ (char) 8, (char) 0, (char)-2},//Layer-2
+							{ (char) 8, (char) 0, (char)-1},//Layer-3
+							{ (char) 8, (char)-1, (char)-1},//Layer-4
+							{ (char) 8, (char)-1, (char)-1},//Layer-5
+							{ (char)11, (char)-1, (char) 0},//Layer-6
+							{ (char)10, (char) 0, (char) 2},//Layer-7
+							{ (char)10, (char) 2, (char) 2}//Layer-8
 							};
 
 unsigned input_config[5] = {227, 227, 3, 1}; //original image size(dim1, dim2, dim3), batch size
@@ -1095,7 +1095,7 @@ unsigned eltwise_layer_previous[]={0,1,1,3,4,5,6,7,8,9,
 // ((frac_w+frac_din)-frac_dout))>0
 // if have bias (frac_w-frac_dout-1)>0
 char precision_config[][3] ={										
-{	7	,	0	,	-4	}	,	//	layer-1	
+{	7	,	0	,	(char)-4	}	,	//	layer-1	
 {	7	,	3	,	2	}	,	//	layer-2	
 {	7	,	3	,	2	}	,	//	layer-3	
 {	8	,	4	,	4	}	,	//	layer-4	

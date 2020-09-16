@@ -144,9 +144,9 @@ const char *dump_file_path = "./result_dump.txt";
 #define WEIGHTS_FILE_SIZE 61063552  //fc8-1024
 #define LAYER_NUM         8//8
 #define CONV_NUM          5
-const char *weight_file_path = "../data_alex/weights.dat";
-const char *input_file_path  = "../data_alex/image.dat";
-const char *ref_file_path    = "../data_alex/fc8.dat";
+const char *weight_file_path = "./data_alex/weights.dat";
+const char *input_file_path  = "./data_alex/image.dat";
+const char *ref_file_path    = "./data_alex/fc8.dat";
 const char *dump_file_path   = "./result_dump.txt";
 #endif
 
@@ -178,14 +178,14 @@ const char *dump_file_path   = "./result_dump.txt";
 //#define LAYER_NUM         	54
 #define LAYER_NUM         	54
 #define CONV_NUM         	53
-const char *weight_file_path = "./data/data_resnet/weights_qt.data";
-const char *mean_file_path = "./data/data_resnet/mean.data";
-const char *var_file_path = "./data/data_resnet/var.data";
-const char *alpha_file_path = "./data/data_resnet/alpha.data";
-const char *beta_file_path = "./data/data_resnet/beta.data";
-const char *input_file_path = "./data/data_resnet/image.data";
-const char *ref_file_path = "./data/data_resnet/fc1024.data";
-const char *dump_file_path = "./result_dump.txt";
+const char *weight_file_path = "./data_resnet/weights_qt.data";
+const char *mean_file_path   = "./data_resnet/mean.data";
+const char *var_file_path    = "./data_resnet/var.data";
+const char *alpha_file_path  = "./data_resnet/alpha.data";
+const char *beta_file_path   = "./data_resnet/beta.data";
+const char *input_file_path  = "./data_resnet/image.data";
+const char *ref_file_path    = "./data_resnet/fc1024.data";
+const char *dump_file_path   = "./result_dump.txt";
 #endif
 //ResNet maxpool need padding
 #ifdef RESNET
@@ -481,8 +481,8 @@ int main(int argc, char** argv)
 		knl_memWr[i] = clCreateKernel(program, knl_name_memWr, &status);
 		checkError(status, "Failed to create memWr kernel");
 
-		// knl_lrn[i] = clCreateKernel(program, knl_name_lrn, &status);
-		// checkError(status, "Failed to create lrn kernel");
+		knl_lrn[i] = clCreateKernel(program, knl_name_lrn, &status);
+		checkError(status, "Failed to create lrn kernel");
 #ifdef RESNET
 		que_bn[i] = clCreateCommandQueue(context, device[device_ptr], CL_QUEUE_PROFILING_ENABLE, &status);
 		checkError(status, "Failed to create command queue 4");
@@ -1292,7 +1292,10 @@ int main(int argc, char** argv)
 			}
 			#endif
 
-
+#ifdef XILINX
+			printf("\nLaunching single work-item kernel MemWr\n");
+			status = clEnqueueTask(que_memWr[i], knl_memWr[i], 0, NULL, &memWr_event[i]);
+#else
 			// kernel memWr
 			knl_memWr_global_size[0] = memWr_dim1;
 			knl_memWr_global_size[1] = memWr_dim2;
@@ -1305,10 +1308,8 @@ int main(int argc, char** argv)
 				printf("\nLaunching kernel MemWr with local size: %d, %d, %d  (global size: %d, %d, %d)\n",
 									(int)knl_memWr_local_size[0], (int)knl_memWr_local_size[1], (int)knl_memWr_local_size[2],
 									(int)knl_memWr_global_size[0], (int)knl_memWr_global_size[1], (int)knl_memWr_global_size[2]);
-
 			status = clEnqueueNDRangeKernel(que_memWr[i], knl_memWr[i], 3, NULL, knl_memWr_global_size, knl_memWr_local_size, 0, NULL, &memWr_event[i]);
-			//status = clEnqueueTask(que_memWr[i], knl_memWr[i], 0, NULL, &memWr_event[i]);
-
+#endif
 			checkError(status, "Failed to launch kernel memWr");
 
 			if(layer_config[j][pool_on]==1){

@@ -13,8 +13,8 @@ if __name__ == '__main__':
     for j in range(0,lane):
         code_str += 'pipe char bias_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'+\
     	            'pipe char conv_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'+\
-    				'pipe char pool_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'+\
-    				'pipe char bypass_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'
+    				'pipe char batchNorm_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'+\
+    				'pipe char bypass_bn_ch' + str(j) + ' __attribute__((xcl_reqd_pipe_depth(32)));\n'
     code_str += '#define data_write_pipe_block(input_data)  '+\
                 '{char temp[' + str(all) + '];\\\n'
     count = 0
@@ -70,7 +70,7 @@ if __name__ == '__main__':
     			code_str += '                                           read_pipe_block(weight_ch'+str(i*vec_num+j)+', &temp['+str(count-1) +']);\\\n'+\
     			            '                                           input_data.lane[' + str(i) + '].data[' + str(j) + '] = temp['+str(count-1) +'];} \n'
     
-    list_name = ['bias_ch','conv_ch','pool_ch','bypass_ch']
+    list_name = ['bias_ch','conv_ch','batchNorm_ch','bypass_bn_ch']
     for n in range(0,4):
     	code_str += '#define '+ list_name[n]+'_write_pipe_block(input_data)  '+\
     				'{char temp[' + str(lane) + '];\\\n'
@@ -95,7 +95,16 @@ if __name__ == '__main__':
     		else:
     			code_str += '                                           read_pipe_block('+list_name[n]+str(i)+', &temp['+str(count-1) +']);\\\n' +\
     			            '                                           input_data.lane[' + str(i) + '] = temp['+str(count-1) +'];} \n'
-    code_str += '#endif\n'
+    
+	code_str += 'pipe bool pool_sync_ch __attribute__((xcl_reqd_pipe_depth(32)));\n' +\
+			'#define pool_sync_ch_write_pipe_block(input_data) { bool temp; \\\n' +\
+			'                                                    temp = input_data; \\\n' +\
+			'                                                    write_pipe_block(pool_sync_ch, &temp); }\n' +\
+			'#define pool_sync_ch_read_pipe_block(input_data)  { bool temp; \\\n' +\
+			'                                                    read_pipe_block (pool_sync_ch, &temp);\\\n' +\
+			'                                                    input_data = temp;}\n\n'
+	
+	code_str += '#endif\n'
     fd = open('pipe.cl', 'w')
     fd.write(code_str)
     fd.close()

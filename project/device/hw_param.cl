@@ -35,7 +35,7 @@
 #define _HW_PARAM_H
 
 //choose net
-//#define RESNET
+// #define RESNET
 // #define ALEXNET
 #define VGG16
 
